@@ -105,7 +105,6 @@
               <span>I consent to be contacted by phone, text, or email. No spam. Opt out anytime.</span>
             </label>
             <div class="h-captcha" data-sitekey="ES_8120c7e9b8e74a3686f61a68148e15da"></div>
-              <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
             <button type="submit" class="mt-2 inline-flex justify-center rounded-xl bg-zinc-900 px-5 py-3 text-white font-medium hover:bg-black focus:outline-none focus:ring-2 focus:ring-zinc-400" title="Request My Offer">Request My Offer</button>
             <p class="mt-3 hidden text-sm" data-feedback></p>
           </form>
@@ -232,7 +231,6 @@
               <input name="address" class="mt-1 w-full rounded-xl border border-zinc-300 px-3 py-2 outline-none focus:ring-2 focus:ring-zinc-400" placeholder="123 Magnolia Ave, Tallahassee">
             </label>
             <div class="h-captcha" data-sitekey="ES_8120c7e9b8e74a3686f61a68148e15da"></div>
-              <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
             <button type="submit" class="mt-2 inline-flex justify-center rounded-xl bg-zinc-900 px-5 py-3 text-white font-medium hover:bg-black focus:outline-none focus:ring-2 focus:ring-zinc-400" title="Send">Send</button>
             <p class="mt-3 hidden text-sm" data-feedback></p>
           </form>
@@ -273,41 +271,70 @@
     </div>
   </footer>
 
-  <script>
-    document.getElementById('year').textContent = new Date().getFullYear();
+<script>
+  document.getElementById('year').textContent = new Date().getFullYear();
 
-    async function submitForm(formId) {
-      const form = document.getElementById(formId);
-      if (!form) return;
-      const fb = form.querySelector('[data-feedback]');
-      form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const data = new FormData(form);
-        if (data.get('_hp')) return; // honeypot
-        // ensure hCaptcha token exists
-        const token = document.querySelector('#' + formId + ' .h-captcha iframe') ? window.hcaptcha.getResponse(form.querySelector('.h-captcha')) : "";
-        if (!token) {
-          if (fb) { fb.textContent = "Please complete the hCaptcha."; fb.classList.remove('hidden'); fb.classList.add('text-amber-600'); }
-          return;
-        }
-        data.append('h-captcha-response', token);
-        try {
-          const res = await fetch('/submit', { method: 'POST', body: data });
-          if (res.ok) {
-            form.reset();
-            if (window.hcaptcha) window.hcaptcha.reset(form.querySelector('.h-captcha'));
-            if (fb) { fb.textContent = "Thank you—your note arrived. We will respond shortly."; fb.classList.remove('hidden'); fb.classList.remove('text-amber-600','text-red-600'); fb.classList.add('text-emerald-700'); }
-          } else {
-            const msg = (await res.text()) || "Submission failed. Please try again.";
-            if (fb) { fb.textContent = msg; fb.classList.remove('hidden'); fb.classList.remove('text-emerald-700','text-amber-600'); fb.classList.add('text-red-600'); }
-          }
-        } catch (err) {
-          if (fb) { fb.textContent = "Network error. Please try again."; fb.classList.remove('hidden'); fb.classList.remove('text-emerald-700','text-amber-600'); fb.classList.add('text-red-600'); }
-        }
+  const widgetMap = new Map();
+
+  function ensureWidget(form) {
+    const box = form.querySelector('.h-captcha');
+    if (!box) return null;
+    let id = widgetMap.get(form);
+    if (id == null) {
+      // Explicit render for reliability with multiple forms
+      id = hcaptcha.render(box, {
+        sitekey: box.dataset.sitekey // uses the key already in your markup
       });
+      widgetMap.set(form, id);
     }
-    submitForm('lead-top');
-    submitForm('lead-bottom');
-  </script>
+    return id;
+  }
+
+  function attach(formId) {
+    const form = document.getElementById(formId);
+    if (!form) return;
+    const fb = form.querySelector('[data-feedback]');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const data = new FormData(form);
+      if (data.get('_hp')) return; // honeypot
+
+      // Make sure hCaptcha is rendered for THIS form and get its token
+      if (!window.hcaptcha) {
+        if (fb) { fb.textContent = "Captcha is still loading. Please try again."; fb.classList.remove('hidden'); fb.classList.add('text-amber-600'); }
+        return;
+      }
+      const widgetId = ensureWidget(form);
+      const token = hcaptcha.getResponse(widgetId);
+
+      if (!token) {
+        if (fb) { fb.textContent = "Please complete the hCaptcha."; fb.classList.remove('hidden'); fb.classList.remove('text-emerald-700','text-red-600'); fb.classList.add('text-amber-600'); }
+        return;
+      }
+
+      data.append('h-captcha-response', token);
+
+      try {
+        const res = await fetch('/submit', { method: 'POST', body: data });
+        const msg = (res.ok ? "Thank you—your note arrived. We will respond shortly."
+                            : (await res.text()) || "Submission failed. Please try again.");
+        form.reset();
+        hcaptcha.reset(widgetId);
+        if (fb) {
+          fb.textContent = msg;
+          fb.classList.remove('hidden','text-amber-600','text-red-600','text-emerald-700');
+          fb.classList.add(res.ok ? 'text-emerald-700' : 'text-red-600');
+        }
+      } catch {
+        if (fb) { fb.textContent = "Network error. Please try again."; fb.classList.remove('hidden'); fb.classList.remove('text-emerald-700','text-amber-600'); fb.classList.add('text-red-600'); }
+      }
+    });
+  }
+  // Attach to both forms
+  attach('lead-top');
+  attach('lead-bottom');
+</script>
 </body>
 </html>
