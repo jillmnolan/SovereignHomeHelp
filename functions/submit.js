@@ -1,74 +1,119 @@
+// /functions/submit.js (Cloudflare Pages Functions or Workers)
 export const onRequestPost = async (context) => {
   const { request, env } = context;
   const ip = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
   const ua = request.headers.get("User-Agent") || "";
-  const formData = await request.formData();
+  let formData;
 
-  // Basic honeypot
+  try {
+    formData = await request.formData();
+  } catch {
+    return new Response("Invalid form submission.", { status: 400 });
+  }
+
+  // 1) Honeypot (quiet pass)
   if (formData.get("_hp")) {
     return new Response("OK", { status: 200 });
   }
 
-  // hCaptcha server-side verify
-  const token = formData.get("h-captcha-response");
-  if (!token || !env.HCAPTCHA_SECRET) {
+  // 2) hCaptcha server verify
+  const token = String(formData.get("h-captcha-response") || "").trim();
+  const secret = env.HCAPTCHA_SECRET;
+
+  if (!secret) {
+    // Misconfiguration: no secret on server
+    return new Response("Server not configured (captcha secret).", { status: 500 });
+  }
+  if (!token) {
     return new Response("Captcha required", { status: 400 });
   }
 
-  const verifyRes = await fetch("https://hcaptcha.com/siteverify", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ secret: env.HCAPTCHA_SECRET, response: token, remoteip: ip })
+  // NB: official endpoint is https://hcaptcha.com/siteverify
+  // Use x-www-form-urlencoded
+  const params = new URLSearchParams({
+    secret,
+    response: token,
+    remoteip: ip
   });
-  const verify = await verifyRes.json().catch(() => ({}));
-  if (!verify.success) {
-    return new Response("Captcha failed", { status: 400 });
+
+  let verify;
+  try {
+    const verifyRes = await fetch("https://hcaptcha.com/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params
+    });
+    verify = await verifyRes.json();
+  } catch {
+    return new Response("Captcha verification unreachable.", { status: 502 });
   }
 
-  // Basic KV rate limiting: 5 submissions per IP per hour
+  if (!verify?.success) {
+    // Surface error codes so you can fix configuration quickly during testing.
+    // In production you might swap this for a generic line.
+    const codes = Array.isArray(verify?.["error-codes"]) ? verify["error-codes"].join(", ") : "unknown";
+    return new Response(`Captcha failed (${codes})`, { status: 400 });
+  }
+
+  // 3) Simple per-IP rate limit via KV
+  // Make sure RL_KV is bound in your project settings.
   const key = `rl:${ip}`;
   const now = Date.now();
-  const windowMs = 60 * 60 * 1000;
+  const windowMs = 60 * 60 * 1000; // 1h
   const limit = 5;
 
-  let state = { hits: [] };
   try {
     const raw = await env.RL_KV.get(key);
-    if (raw) state = JSON.parse(raw);
-  } catch (e) {}
-
-  // filter to current window
-  state.hits = (state.hits || []).filter(ts => now - ts < windowMs);
-  if (state.hits.length >= limit) {
-    return new Response("Rate limit exceeded. Please try again later.", { status: 429 });
+    const state = raw ? JSON.parse(raw) : { hits: [] };
+    const hits = (state.hits || []).filter((ts) => now - ts < windowMs);
+    if (hits.length >= limit) {
+      return new Response("Rate limit exceeded. Please try again later.", { status: 429 });
+    }
+    hits.push(now);
+    await env.RL_KV.put(key, JSON.stringify({ hits }), { expirationTtl: 2 * 60 * 60 }); // 2h
+  } catch {
+    // If KV hiccups, do not block the user—just proceed.
   }
-  state.hits.push(now);
-  await env.RL_KV.put(key, JSON.stringify(state), { expirationTtl: 60 * 60 * 2 });
 
-  // Forward to Formspree
-  if (!env.FORMSPREE_ID) {
+  // 4) Forward to Formspree
+  const formspreeId = env.FORMSPREE_ID;
+  if (!formspreeId) {
     return new Response("Server not configured (Formspree ID missing).", { status: 500 });
   }
-  const fsRes = await fetch(`https://formspree.io/f/${env.FORMSPREE_ID}`, {
-    method: "POST",
-    headers: { "Accept": "application/json" },
-    body: formData
-  });
 
-  // Optional: forward to Zapier webhook
+  let fsRes;
+  try {
+    fsRes = await fetch(`https://formspree.io/f/${formspreeId}`, {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body: formData
+    });
+  } catch {
+    return new Response("Upstream error", { status: 502 });
+  }
+
+  // 5) Optional: Zapier webhook (best-effort, non-blocking)
   if (env.ZAPIER_HOOK) {
-    try {
-      const json = {};
-      for (const [k, v] of formData.entries()) { json[k] = v; }
-      json.ip = ip; json.ua = ua; json.when = new Date().toISOString();
-      await fetch(env.ZAPIER_HOOK, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(json)});
-    } catch (e) { /* ignore */ }
+    (async () => {
+      try {
+        const json = {};
+        for (const [k, v] of formData.entries()) json[k] = v;
+        json.ip = ip;
+        json.ua = ua;
+        json.when = new Date().toISOString();
+        await fetch(env.ZAPIER_HOOK, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(json)
+        });
+      } catch {}
+    })();
   }
 
   if (fsRes.ok) {
     return new Response("OK", { status: 200 });
   } else {
-    const t = await fsRes.text();
+    const t = await fsRes.text().catch(() => "");
     return new Response(t || "Upstream error", { status: 502 });
   }
 };
